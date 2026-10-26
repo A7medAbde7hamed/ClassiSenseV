@@ -1,611 +1,159 @@
-# ClassiSense
+# ClassiSenseV · Classroom Observatory
 
-## AI-Powered Smart Classroom Monitoring & IoT System
+An experimental copy of [WalidAhmed89/ClassiSense](https://github.com/WalidAhmed89/ClassiSense), isolated for review and Vercel testing. The original repository is unchanged.
 
-ClassiSense is an intelligent classroom monitoring system that combines **Computer Vision, Artificial Intelligence, Data Science, and IoT** to monitor classroom occupancy, environmental conditions, and safety in real time.
+The application combines a local YOLO/ByteTrack process, an Arduino with an autonomous gas alarm, a durable Firebase upload outbox, and a blue/violet PWA dashboard. Vercel hosts the dashboard and read-only API; video processing and hardware control remain on the classroom computer and Arduino.
 
-The system uses a camera to analyze the classroom and estimate the number of students present. An Arduino or ESP32 connects directly to the Computer Vision computer (for example, through USB Serial) to provide sensor readings and receive device-control commands. The API layer is reserved for communication between the Computer Vision application and the frontend dashboard; the microcontroller does not need to communicate with the backend API.
+## What is implemented
 
-The collected data is stored and analyzed to discover patterns, visualize classroom behavior, and build Machine Learning models that can make predictions and intelligent decisions.
+- Arduino-owned MQ-5 buzzer logic. No video frame, cloud request, or computer connection is required for the gas alarm loop.
+- Versioned JSON telemetry over USB Serial, handled in a separate Python reader thread.
+- Sensor states: `healthy`, `danger`, `disconnected`, `stale`. A missing reading is never presented as safe.
+- Durable SQLite outbox with worker-thread uploads, bounded exponential backoff, live-status coalescing, alert priority, and idempotent event IDs.
+- Path-independent command-line capture runner; bounded read retries; deterministic cleanup after failure.
+- Live data, occupancy history, alert filtering, device freshness, CSV export, password-protected live workspace and explicit demo mode.
+- Installable PWA with standalone manifest, regular/maskable icons and an offline interface. API responses, authentication, and live readings are never cached by the service worker.
+- Per-frame CSV metrics and count evaluation against manually annotated frames.
+- Automated Python, Node, and native firmware simulation tests; CI additionally compiles the sketch for Arduino Uno.
 
-Based on the detected conditions, the Computer Vision application can send control commands directly to the Arduino or ESP32, which operates classroom devices such as lights and alarms. Local safety actions should not depend on the dashboard or network being available.
+## Quick start: dashboard
 
----
+Requires Node.js 24. The dashboard and API have no npm runtime dependencies.
 
-## Project Objectives
-
-The main objectives of ClassiSense are:
-
-* Detect and count students inside a classroom using Computer Vision.
-* Monitor classroom environmental conditions using IoT sensors.
-* Automatically control classroom lighting based on occupancy.
-* Detect dangerous situations and trigger safety alerts.
-* Collect and store real-time classroom data.
-* Analyze collected data using Data Science techniques.
-* Visualize classroom statistics and patterns.
-* Apply Machine Learning for prediction and anomaly detection.
-* Demonstrate the integration between AI, Data Science, and IoT in a real-world scenario.
-
----
-
-# System Overview
-
-The system has three main parts: the Computer Vision application, the directly connected IoT controller, and the dashboard/backend software.
-
-```text
-                    Physical Classroom
-                           |
-              +------------+------------+
-              |                         |
-            Camera                 Sensors / Devices
-              |                         |
-              v                         v
-      Computer Vision  <---Serial---> Arduino / ESP32
-      (Python, OpenCV,                  |   |
-       YOLO, decision logic)            |   +--> Lights / Buzzer / Relays
-              |
-              | REST API (software data only)
-              v
-        Backend / API Layer
-              |
-        +-----+------+
-        |            |
-        v            v
-    Database    Frontend Dashboard
-        |
-        v
- Historical Data / Data Science / ML
+```bash
+npm ci
+npm run dev
+# http://localhost:3000
 ```
 
-**Communication rule:** the Arduino/ESP32 connects directly to the Computer Vision application, typically over USB Serial for the first implementation. The API is used only for exchanging application data between the Computer Vision side and the dashboard software through the backend. There is no separate API connection between the microcontroller and the backend.
----
+Open **Explore demo** for explicitly labelled sample data, or append `?demo=1`. The default workspace shows a setup state until live data is configured. A sample seating schematic does not locate or identify individual students.
 
-# Main Features
-
-## 1. Student Detection & Counting
-
-A camera monitors the classroom and Computer Vision is used to detect people.
-
-The system can determine:
-
-* Number of students currently inside the classroom.
-* Classroom occupancy percentage.
-* Occupancy changes over time.
-* Entry and exit activity.
-
-Example:
-
-```text
-Students Detected: 24
-Occupancy: 80%
-Status: Occupied
+```bash
+npm run build
+npm test
+python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
----
+## Connect a TEST Firebase project
 
-## 2. Smart Lighting
+1. Create or select a dedicated **test** Firebase project with Cloud Firestore enabled. Do not point this experimental fork at the leader's production database.
+2. In Vercel project environment variables, set:
+   - `FIREBASE_SERVICE_ACCOUNT_JSON`: the complete service-account JSON, stored as a server-only Secret.
+   - `DASHBOARD_PASSWORD`: a long random workspace password, stored as a server-only Secret.
+3. Redeploy, then open **Connection settings** and enter the workspace password. Live endpoints fail closed when authentication is missing.
+4. On the local CV computer, set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key for the same test project, outside the repository. The historical fallback path `ai/people-tracking/serviceAccountKey.json` is supported and gitignored.
+5. Run the tracker. Live status is queued every 2 seconds, history every 180 seconds, hazards immediately with a 60-second repeat cooldown.
 
-The system uses classroom occupancy information to control the lights.
+The API uses server-side Google OAuth and Firestore REST. No Firebase service-account key or workspace password is shipped to the browser. Sessions use an eight-hour signed HttpOnly, Secure, SameSite cookie. Use HTTPS (Vercel or another TLS proxy) when testing login; the plain HTTP local dev server is for demo/setup mode.
 
-For example:
+The client polls every 10 seconds. A last sample older than 15 seconds is shown as stale. Legacy `main` records without `sampled_at` and sensor states are not treated as verified live telemetry. New history starts when the updated tracker begins sending readings.
 
-```text
-Students = 0
-        |
-        v
-Classroom Empty
-        |
-        v
-Lights OFF
-```
-
-When students are detected:
+Suggested Firestore client rules for this server-only access pattern:
 
 ```text
-Students > 0
-        |
-        v
-Classroom Occupied
-        |
-        v
-Lights ON
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} { allow read, write: if false; }
+  }
+}
 ```
 
-A delay can be added to prevent the lights from turning off because of temporary detection errors.
+Deploy these rules in the **test project** after reviewing them. Admin SDK / service-account access uses IAM, so rules do not restrict that account. For sharing beyond a small test workspace, replace the shared password with per-user authentication, configure edge rate limiting, and assign narrower service-account permissions.
 
----
+## Upload the Arduino firmware first
 
-## 3. Environmental Monitoring
+**The new Python bridge is incompatible with StandardFirmata.** Upload `firmware/classisense/classisense.ino` with Arduino IDE (Uno or Nano), then close the serial monitor before starting Python. No additional Arduino libraries are required.
 
-The ESP32 collects environmental data using different sensors.
+| Component | Pin | Notes |
+|---|---|---|
+| Classroom LED | D2 | Series resistor; use an appropriate driver for larger loads |
+| Active buzzer | D3 | Verify electrical requirements for your buzzer |
+| MQ-5 DO | D4 | Active LOW; powered from the correct supply |
+| LM35 Vout | A0 | 5 V ADC reference configured in the sketch |
+| Ground | GND | Common ground |
 
-Possible measurements include:
+Serial: **115200 baud**. Protocol v1 emits a full JSON snapshot every 500 ms. The only host command is `OCCUPANCY <integer>\n`; there is deliberately no remote command to silence the gas alarm.
 
-* Temperature
-* Humidity
-* Light intensity
-* Air quality / CO2
-* Other environmental measurements depending on available hardware
+- Gas LOW drives the buzzer immediately, including during warmup.
+- Gas HIGH during the first 60 seconds is shown as `stale` (warmup), not healthy. Tune warmup/calibration to the actual sensor and its datasheet; first-use conditioning may take longer.
+- No host heartbeat for 15 seconds leaves lighting ON; the local gas loop continues.
+- No occupancy for 10 seconds with a connected host turns lighting OFF.
+- A digital MQ-5 DO line **cannot reliably distinguish safe HIGH from a disconnected cable**. A real wire/power diagnostic needs additional circuitry and protocol support. The UI discloses this limitation.
+- LM35 rail/out-of-range readings are marked disconnected. A floating input can produce plausible values; reliable cable diagnosis also requires hardware design. Do not claim cable-fault coverage from range checking alone.
 
-Example:
+Prototype sensors and this code are not certified fire/gas safety equipment. Keep any required certified safety system in place.
+
+See [hardware checks](docs/hardware-acceptance.md) before testing with devices.
+
+## Run the local tracker
+
+Python 3.12 is used by CI and the recorded benchmark. Install CPU/GPU PyTorch as appropriate for your machine, then the pinned application requirements:
+
+```bash
+python -m venv .venv
+# Activate .venv for your platform
+python -m pip install -r ai/people-tracking/requirements.txt
+python ai/people-tracking/tracker.py --port COM5 --source 0
+```
+
+For an offline video test with no Arduino or Firebase:
+
+```bash
+python ai/people-tracking/tracker.py --source ai/people-tracking/video.mp4 \
+  --no-hardware --no-cloud --headless --max-frames 120 \
+  --metrics reports/metrics.csv
+```
+
+Paths are resolved against the repository root, regardless of the shell working directory. Cameras default to index 0. Files stop at EOF; `--loop` explicitly enables looping. `--device`, `--confidence`, `--imgsz`, and `--max-frames` are configurable. Press Q in GUI mode or Ctrl+C to stop.
+
+Default input size is 960 with confidence 0.2. The count measures visible detected **people**, including teachers; it does not identify students, register named attendance, or count entry/exit events. FPS is processing throughput, not source video FPS.
+
+## Outbox behavior and recovery
+
+Default database: `~/.classisense/outbox.sqlite3`. Override with `CLASSISENSE_OUTBOX`. Use local durable storage, not a network share.
+
+- Producer transactions only touch SQLite; network calls run in a worker.
+- Failed jobs remain committed and are retried with backoff (1–60 seconds).
+- Live snapshots coalesce to the latest pending snapshot. Historical samples and alerts retain their event IDs across retries and restarts.
+- A successful write is acknowledged only after the server responds. Retrying `.set()` with the same document ID prevents duplicate event documents.
+- Queue capacity is 100,000 records. Disk-full/queue-full errors are surfaced rather than silently dropping history. Restore connectivity or archive the database before retrying.
+- Shutdown waits up to 7 seconds for the worker. Committed unfinished jobs remain on disk for the next run.
+
+## Firestore data contract
+
+| Path | Purpose |
+|---|---|
+| `classroom/live_status` | Latest classroom snapshot |
+| `monitoring_logs/{event_id}` | Periodic historical samples |
+| `alerts/{event_id}` | Hazard snapshots with `alert_type` and `severity` |
+
+Snapshots include `sampled_at` (Unix seconds), `people_count`, `temperature_c` (nullable), `gas_detected` (nullable), `gas_state`, `temperature_state`, `controller_state`, `source_state`, `sensor_age_seconds`, `lights_on` (nullable), `buzzer_on` (nullable), `led_on_seconds`, `fps`, and `inference_ms`. `updated_at`/`created_at` are server timestamps; freshness is determined from sample time so delayed uploads cannot look newly sampled.
+
+The dashboard supports 24h/7d/30d queries, bounded to the most recent 1,000 history documents and 1,000 alerts per request. Truncation is displayed. Larger deployments should add pagination/aggregation and per-room identities.
+
+## Accuracy and performance
+
+See [the benchmark report](docs/benchmark.md) and [manual reference counts](docs/ground-truth-sample.csv). To evaluate your own annotated data:
+
+```bash
+python tools/evaluate_counts.py reports/metrics.csv docs/ground-truth-sample.csv \
+  --output reports/evaluation.json
+```
+
+Reference CSV format: `frame,people_count`. Annotate original frames independently of predictions. This tool reports MAE, RMSE, bias, exact-count rate, within-one rate and median throughput; it does not invent accuracy when reference labels are absent.
+
+## Repository layout
 
 ```text
-Temperature: 26°C
-Humidity: 48%
-Light: 350 lux
-CO2: 850 ppm
+ai/people-tracking/   Local CV runner, serial bridge and Firebase outbox
+firmware/classisense/ Standalone Arduino sketch
+public/               PWA dashboard and assets
+api/                  Vercel read-only data and session endpoints
+lib/                  Google OAuth, Firestore decoding, session signing
+tests/                Network/sensor/capture/auth tests and firmware simulation
+tools/                Dev server, web checks and count evaluation
+docs/                 Benchmark, deployment and hardware acceptance notes
 ```
 
----
-
-## 4. Safety Monitoring
-
-The system can monitor potentially dangerous conditions.
-
-For example:
-
-* Fire / flame detection
-* Smoke detection
-* Abnormal temperature
-* Other safety-related sensor readings
-
-When a dangerous condition is detected:
-
-```text
-Danger Detected
-      |
-      v
-ESP32
-      |
- +----+----+
- |         |
- v         v
-Buzzer   Warning
-```
-
-The Computer Vision application can forward an alert to the dashboard through the API. The Arduino/ESP32 should still activate its local buzzer or other local safety output directly when the connected safety sensor detects a configured danger condition.
-
----
-
-# Artificial Intelligence & Computer Vision
-
-ClassiSense uses Computer Vision to understand the classroom environment from camera input.
-
-### Technologies
-
-* Python
-* OpenCV
-* YOLO or another suitable object detection model
-
-OpenCV is responsible for image and video processing, while the detection model is used to identify objects such as people.
-
-Example pipeline:
-
-```text
-Camera
-   |
-   v
-Video Frame
-   |
-   v
-OpenCV
-   |
-   v
-Object Detection Model
-   |
-   v
-Person Detection
-   |
-   v
-People Count
-```
-
-The project may also use Computer Vision / AI models for safety detection such as fire or smoke detection, depending on the final implementation.
-
----
-
-# Data Science
-
-Data Science is an important part of ClassiSense.
-
-The Computer Vision application receives sensor readings directly from the connected Arduino/ESP32 and combines them with occupancy results before sending relevant data to the backend for storage.
-
-Example dataset:
-
-| Timestamp | Students | Temperature | Humidity | Light | Fire |
-| --------- | -------: | ----------: | -------: | ----: | ---- |
-| 09:00     |       12 |        24.1 |       45 |   320 | 0    |
-| 10:00     |       25 |        25.2 |       48 |   350 | 0    |
-| 11:00     |       31 |        27.0 |       52 |   280 | 0    |
-| 12:00     |        0 |        25.8 |       49 |   300 | 0    |
-
-This data can be used for:
-
-* Exploratory Data Analysis (EDA)
-* Data cleaning
-* Data visualization
-* Correlation analysis
-* Occupancy analysis
-* Energy usage analysis
-* Anomaly detection
-* Machine Learning
-
----
-
-# Machine Learning
-
-Machine Learning can be used to make predictions based on historical classroom data.
-
-Possible ML tasks include:
-
-### Classroom Occupancy Prediction
-
-Predict the expected number of students based on:
-
-* Time
-* Day
-* Previous occupancy
-* Temperature
-* Classroom schedule
-* Historical data
-
-Example:
-
-```text
-Input:
-Day       = Monday
-Time      = 10:00 AM
-Previous  = 22 Students
-
-Prediction:
-Expected Occupancy = 27 Students
-```
-
-### Anomaly Detection
-
-The system can identify unusual classroom conditions.
-
-For example:
-
-```text
-Normal Occupancy: 15 - 30 students
-
-Detected:
-58 students
-
-Result:
-Occupancy Anomaly
-```
-
-The exact Machine Learning model will depend on the collected dataset and the final project requirements.
-
----
-
-# IoT System
-
-The hardware controller can be an **Arduino Uno** or an **ESP32**. It connects directly to the computer running the Computer Vision application, rather than sending sensor data to the backend itself.
-
-The direct connection can use:
-
-* **USB Serial** — recommended for the initial prototype and suitable for either Arduino Uno or ESP32.
-* **Wi-Fi** — optional for a later ESP32-based implementation if wireless communication is needed. The project does not require the ESP32 to call backend APIs.
-
-The microcontroller is responsible for:
-
-* Reading connected sensor values.
-* Sending sensor readings to the Computer Vision application over the direct connection.
-* Receiving control commands from the Computer Vision application.
-* Controlling lights, relays, LEDs, and buzzers.
-* Performing essential local safety actions without depending on the dashboard or internet connection.
-
-Possible hardware components:
-
-### Main Controller
-
-* Arduino Uno R3 or ESP32 Development Board
-
-### Sensors
-
-Depending on the final implementation:
-
-* DHT22 / DHT11 — Temperature & Humidity
-* LDR — Light Intensity
-* MQ-series sensor or suitable air-quality sensor
-* Flame Sensor
-* Smoke Sensor
-* Additional sensors if required
-
-### Actuators
-
-* LED / LED Strip or small DC light
-* Buzzer
-* Relay Module
-* Optional OLED/LCD Display
-
-**Safety note:** prototype flame/smoke sensors are not certified fire-alarm equipment. Any real-world installation must retain suitable certified fire-safety systems.
----
-
-# Software Architecture
-
-The Computer Vision application is the integration point for the camera and the directly connected IoT controller. The dashboard does not communicate with the microcontroller directly.
-
-```text
-Camera --> Computer Vision / AI Application <--> Arduino or ESP32
-                         |
-                         | REST API
-                         v
-                   Backend Services
-                         |
-                    PostgreSQL
-                         |
-                         v
-                Frontend Dashboard
-```
-
-The Computer Vision application:
-
-* Processes camera frames and calculates classroom occupancy.
-* Receives sensor readings from the Arduino/ESP32 over the direct connection.
-* Applies decision logic and sends device-control commands back to the controller.
-* Sends occupancy, sensor data, and alerts to the backend through the API for display and storage.
-
-The backend provides the API used by the Computer Vision application and dashboard software, validates and stores incoming data, and serves the information needed by the dashboard. The Arduino/ESP32 does **not** call these APIs.
-
-The initial direct hardware connection can use USB Serial. ESP32 Wi-Fi or MQTT may be considered as a future option, but is not required for the architecture described here.
----
-
-# Suggested Technology Stack
-
-## Hardware
-
-* ESP32
-* DHT11 / DHT22
-* LDR
-* Flame Sensor
-* Smoke / Air Quality Sensor
-* Buzzer
-* LEDs
-* Relay Module
-* Optional OLED/LCD
-* Camera / Webcam
-
-## Computer Vision & AI
-
-* Python
-* OpenCV
-* YOLO
-* NumPy
-* Optional: PyTorch
-
-## Data Science
-
-* Python
-* Pandas
-* NumPy
-* Matplotlib
-* Seaborn
-* Scikit-learn
-* Jupyter Notebook
-
-## Backend
-
-* Java
-* Spring Boot
-* REST APIs
-* PostgreSQL
-
-## Communication
-
-* USB Serial between the Computer Vision computer and Arduino/ESP32 (initial implementation)
-* HTTP/REST API between the Computer Vision application and the backend/dashboard software
-* Optional ESP32 Wi-Fi or MQTT in a future version; not required for the initial design
-
-## Development Tools
-
-* IntelliJ IDEA
-* VS Code
-* Arduino IDE
-* Jupyter Notebook
-* Git & GitHub
-* Postman
-
----
-
-# Data Flow
-
-The complete system follows this process:
-
-```text
-1. Camera captures classroom video
-                |
-                v
-2. Computer Vision detects and counts people
-                |
-                +<---- Direct Serial connection ----> Arduino / ESP32
-                |                                      |          |
-                |                               Sensor readings  Device control
-                |                                      |          |
-                +<--------------------------------------+          v
-                |                                         Lights / Buzzer
-                v
-3. Computer Vision sends occupancy, sensor readings, and alerts
-   to the backend through the REST API
-                |
-                v
-4. Backend validates and stores data in PostgreSQL
-                |
-                v
-5. Dashboard retrieves and displays current and historical data
-                |
-                v
-6. Data Science / ML analyzes historical data when sufficient data exists
-```
-
-The microcontroller communicates directly with the Computer Vision application. API communication is limited to the software data path between the Computer Vision application and the dashboard/backend. Local device control does not depend on an API request.
----
-
-# Example Scenario
-
-### Classroom is Empty
-
-```text
-Camera:
-Students = 0
-
-Arduino / ESP32 (directly connected):
-Temperature = 25°C
-Humidity = 45%
-
-Computer Vision application:
-Classroom = Empty
-
-Direct command to Arduino / ESP32:
-Lights = OFF
-```
-
-### Students Enter
-
-```text
-Camera:
-Students = 18
-
-Computer Vision application:
-Classroom = Occupied
-
-Direct command to Arduino / ESP32:
-Lights = ON
-```
-
-### Dangerous Condition
-
-```text
-Fire Detection:
-Detected
-
-Arduino / ESP32:
-Activate local buzzer when configured safety sensor triggers
-
-Computer Vision application:
-Safety Status = DANGER
-
-API to dashboard software:
-Alert = Sent
-```
-
----
-
-# Data Visualization
-
-The dashboard can display real-time and historical information such as:
-
-* Current number of students
-* Classroom occupancy
-* Temperature
-* Humidity
-* Light level
-* Safety status
-* Occupancy over time
-* Environmental changes
-* Predicted occupancy
-* Detected anomalies
-
-Example:
-
-```text
-Students Over Time
-
-40 |             *
-30 |        *    * *
-20 |   *    * *  * *
-10 | * *    * *
- 0 +--------------------
-    9   10   11   12
-```
-
----
-
-# Project Structure
-
-A possible project structure:
-
-```text
-ClassiSense/
-│
-├── computer-vision/
-│   ├── detection/
-│   ├── hardware-serial/
-│   ├── models/
-│   └── main.py
-│
-├── data-science/
-│   ├── datasets/
-│   ├── notebooks/
-│   ├── preprocessing/
-│   └── models/
-│
-├── iot/
-│   ├── arduino/
-│   └── esp32/
-│
-├── backend/
-│   └── spring-boot/
-│
-├── dashboard/
-│
-├── database/
-│
-├── docs/
-│
-└── README.md
-```
-
-The exact folder names may change as implementation progresses. The key design decision is that `computer-vision/` communicates directly with the microcontroller, while the API is used for data exchange with the backend/dashboard software.
----
-
-# Expected Results
-
-The final system should be able to:
-
-* Monitor classroom occupancy in real time.
-* Count students using Computer Vision.
-* Collect environmental IoT data.
-* Automatically control classroom lighting.
-* Detect dangerous conditions.
-* Trigger safety alerts.
-* Store historical data.
-* Analyze classroom behavior using Data Science.
-* Visualize collected data.
-* Apply Machine Learning for prediction or anomaly detection.
-* Demonstrate direct communication between the Computer Vision application and IoT hardware, plus API-based data exchange with the dashboard software.
-
----
-
-# Future Improvements
-
-Possible future improvements include:
-
-* Face recognition for automated attendance.
-* More advanced occupancy prediction.
-* Energy consumption prediction.
-* Advanced fire and smoke detection.
-* Mobile application.
-* Cloud deployment.
-* Multiple classroom support.
-* Centralized monitoring for an entire building.
-* Real-time notifications.
-* More advanced Machine Learning models.
-
----
-
-# Team
-
-ClassiSense is developed as an academic project combining:
-
-* Internet of Things (IoT)
-* Computer Vision
-* Artificial Intelligence
-* Data Science
-* Machine Learning
-* Backend Development
-
-The project is designed to demonstrate how these technologies can work together to create an intelligent and automated classroom environment.
+The original aspirational README is retained in `docs/original-project-vision.md`; its Spring Boot/PostgreSQL and future ML features are not part of this implementation.

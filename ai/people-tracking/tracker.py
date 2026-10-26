@@ -1,141 +1,117 @@
-"""
-ClassiSense - نظام المراقبة الذكي للقاعات الدراسية
-- الكشف عن الطلاب وتتبعهم وتحديد عددهم عبر نموذج YOLO
-- التحكم الذكي في إضاءة القاعة وتشغيل الإنذار عبر Arduino
-- قراءة حساسات الحرارة (LM35) والغاز (MQ-5)
-- إرسال البيانات دورياً كل 3 دقائق لجدول monitoring_logs
-- إرسال تنبيه فوري لجدول alerts عند وجود خطر
-"""
-
-import sys
-import time
+"""ClassiSense capture runner. Import-safe; all resources have deterministic cleanup."""
+import argparse
+import csv
+import os
 from pathlib import Path
-import cv2
-from ultralytics import YOLO
-
-# إضافة المسار الحالي لـ sys.path لضمان استيراد الملفات بسلاسة
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
+import time
 from arduino_controller import ClassroomController
 from database import DatabaseManager
 
+ROOT = Path(__file__).resolve().parents[2]
 
-# ==============================================================================
-# 1. إعداد وحدة التحكم بالأردوينو (Arduino Controller)
-# ==============================================================================
-controller = ClassroomController(
-    port="COM5",            # بورت الأردوينو
-    led_pins=(2,),          # Pin 2: إضاءة الـ LED
-    buzzer_pin=3,           # Pin 3: إنذار الـ Buzzer
-    gas_digital_pin=4,      # Pin 4: مستشعر الغاز MQ-5 (طرف DO الرقمي فقط)
-    gas_analog_pin=None,    # تم إلغاؤه لأن الحساس موصل ديجيتال فقط (قراءة 0 أو 1)
-    temp_pin=0,             # Pin A0: مستشعر الحرارة LM35
-    empty_delay=10,         # ثواني الانتظار قبل إطفاء النور بعد خروج الطلاب
-    sampling_ms=500,        # أخذ عينات كل نصف ثانية لتهدئة وميض لمبة TX ومنفذ السيريال
-    enabled=True            # اجعلها False لو بتجرب بدون توصيل الأردوينو
-)
 
-# ==============================================================================
-# 2. إعداد قاعدة بيانات Firebase Firestore
-# ==============================================================================
-db_manager = DatabaseManager()
+def capture_source(value):
+    if value.isdigit():
+        return int(value)
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else ROOT / path)
 
-# ==============================================================================
-# 3. تحميل نموذج الذكاء الاصطناعي YOLO
-# ==============================================================================
-# تحميل الموديل (يبحث في المجلد الحالي أو مجلد المشروع الرئيسي)
-model_path = "yolo26n.pt"
 
-# إعدادات الـ Detection (مأخوذة من yolo26.py عشان أدق نتيجة)
-IMAGE_SIZE  = 640          # حجم الصورة اللي بيشوفها الموديل
-CONFIDENCE = 0.15          # threshold منخفض عشان يديتكت أكتر ناس
-TRACKER     = "bytetrack.yaml"  # أفضل tracker للتتبع المتواصل
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", default="0", help="Camera index or file path relative to repository root")
+    parser.add_argument("--model", default="yolo26n.pt")
+    parser.add_argument("--port", default=os.getenv("CLASSISENSE_PORT"))
+    parser.add_argument("--no-hardware", action="store_true")
+    parser.add_argument("--no-cloud", action="store_true")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--loop", action="store_true", help="Explicitly loop video files")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--confidence", type=float, default=0.2)
+    parser.add_argument("--imgsz", type=int, default=960, help="YOLO input size; larger images help small or occluded people")
+    parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--metrics", help="Write per-frame count and FPS as CSV")
+    args = parser.parse_args(argv)
+    import cv2
+    from ultralytics import YOLO
+    controller = db = cap = metrics_file = None
+    try:
+        model = YOLO(str(capture_source(args.model)))
+        source = capture_source(args.source)
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video source: {source}")
+        controller = ClassroomController(port=args.port, enabled=not args.no_hardware)
+        db = None if args.no_cloud else DatabaseManager()
+        writer = None
+        if args.metrics:
+            Path(args.metrics).parent.mkdir(parents=True, exist_ok=True)
+            metrics_file = open(args.metrics, "w", newline="", encoding="utf-8")
+            writer = csv.writer(metrics_file)
+            writer.writerow(["frame", "video_seconds", "people_count", "inference_ms", "fps"])
+        frame_number = failures = 0
+        last_frame_time = time.monotonic()
+        while True:
+            success, frame = cap.read()
+            if not success:
+                failures += 1
+                if isinstance(source, str):
+                    if args.loop and failures <= 3:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    break
+                if failures >= 5:
+                    raise RuntimeError("Camera stopped producing frames")
+                time.sleep(0.1)
+                continue
+            failures = 0
+            started = time.perf_counter()
+            result = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=[0], conf=args.confidence, imgsz=args.imgsz, device=args.device, verbose=False)[0]
+            inference_ms = (time.perf_counter()-started)*1000
+            count = len(result.boxes) if result.boxes is not None else 0
+            now = time.monotonic()
+            fps = 1 / max(now-last_frame_time, 0.000001)
+            last_frame_time = now
+            data = controller.update(count)
+            data.update(fps=round(fps, 2), inference_ms=round(inference_ms, 2), source_state="healthy")
+            if db:
+                db.publish(data)
+            if writer:
+                writer.writerow([frame_number, cap.get(cv2.CAP_PROP_POS_MSEC)/1000, count, round(inference_ms, 2), round(fps, 2)])
+            if not args.headless:
+                shown = result.plot()
+                lines = [f"Occupancy: {count} | FPS: {fps:.1f}", f"Gas: {data['gas_state']} | Temp: {data['temperature_state']}", db.get_hud_status() if db else "Cloud disabled"]
+                for i, line in enumerate(lines):
+                    cv2.putText(shown, line, (20, 30+i*30), cv2.FONT_HERSHEY_SIMPLEX, .65, (200, 220, 255), 2)
+                cv2.imshow("ClassiSense", shown)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            frame_number += 1
+            if args.max_frames and frame_number >= args.max_frames:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if controller and db:
+            try:
+                state = controller.get_sensor_data()
+                state.update(source_state="disconnected", stopped=True)
+                db.publish(state, now=float("inf"))
+            except Exception as exc:
+                print(f"[WARN] Could not queue final status: {type(exc).__name__}")
+        # A failure closing one resource must never skip the remaining resources.
+        cleanups = [controller.close if controller else None,
+                    db.close if db else None,
+                    cap.release if cap else None,
+                    metrics_file.close if metrics_file else None,
+                    cv2.destroyAllWindows if not args.headless else None]
+        for cleanup in cleanups:
+            if cleanup:
+                try:
+                    cleanup()
+                except Exception as exc:
+                    print(f"[WARN] Cleanup failed: {type(exc).__name__}")
 
-print(f"[INFO] Loading YOLO model: {model_path}")
-model = YOLO(model_path)
 
-# ==============================================================================
-# 4. فتح الكاميرا (أو ملف الفيديو)
-# ==============================================================================
-# 0 للكاميرا، أو مسار ملف فيديو مثل "video.mp4"
-
-# cap = cv2.VideoCapture(0)
-
-# if not cap.isOpened() and (CURRENT_DIR / "video.mp4").exists():
-#     print("[WARN] Camera not available, falling back to video.mp4")
-#     cap = cv2.VideoCapture(str(CURRENT_DIR / "video.mp4"))
-
-cap = cv2.VideoCapture("ai/people-tracking/video.mp4")
-
-# ==============================================================================
-# 5. حلقة المعالجة اللحظية للفيديو (Main Loop)
-# ==============================================================================
-print("[INFO] Starting Classroom Monitoring (Press Q to quit)...")
-
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        # إعادة تشغيل الفيديو تلقائياً لو كان ملف فيديو
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        continue
-
-    # 1. تتبع الأشخاص باستخدام YOLO — نفس إعدادات yolo26.py بالظبط
-    results = model.track(
-        frame,
-        persist=True,
-        tracker=TRACKER,
-        classes=[0],           # نفلتر على الناس مباشرةً داخل الموديل
-        conf=CONFIDENCE,       # 0.15 — أحساس أعلى للديتكشن
-        imgsz=IMAGE_SIZE,      # 640
-        device="cpu",
-        verbose=False,
-    )
-
-    result     = results[0]
-    frame      = result.plot()  # يرسم الـ boxes والـ labels تلقائياً زي yolo26.py
-    occupancy_count = len(result.boxes) if result.boxes is not None else 0
-
-    # 2. تحديث الأردوينو (التحكم بالأنوار + قراءة الحساسات)
-    controller.update(occupancy_count)
-    sensor_data = controller.get_sensor_data()
-
-    temp_val = sensor_data.get("temperature_c")
-    gas_detected = sensor_data.get("gas_detected", 0)  # 0: مفيش غاز، 1: فيه تسريب غاز
-    gas_danger = bool(gas_detected)
-    lights_state = "ON" if sensor_data.get("lights_on") else "OFF"
-    led_sec = sensor_data.get("led_on_seconds", 0)
-
-    # 3. إرسال البيانات لقاعدة بيانات MySQL
-    # أ) تسجيل دوري في monitoring_logs كل 3 دقائق
-    db_manager.check_and_log_monitoring(sensor_data)
-
-    # ب) تسجيل فوري في alerts عند وجود تسريب غاز (1) أو حرارة مرتفعة
-    db_manager.check_and_trigger_alerts(gas_danger, temp_val)
-
-    # 4. عرض البيانات على شاشة الكاميرا (HUD)
-    cv2.putText(frame, f"Occupancy: {occupancy_count}", (30, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.putText(frame, f"Temp: {temp_val} C" if temp_val else "Temp: Reading...", (30, 75),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
-    cv2.putText(frame, "Gas: DANGER (1)" if gas_danger else "Gas: Safe (0)", (30, 110),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255) if gas_danger else (0, 255, 0), 2)
-    cv2.putText(frame, f"Lights: {lights_state} ({led_sec}s)", (30, 145),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-    cv2.putText(frame, db_manager.get_hud_status(), (30, 180),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
-
-    # عرض الفيديو
-    cv2.imshow("ClassiSense - Smart Classroom Monitoring", frame)
-
-    # الخروج بالضغط على Q
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-# تحرير الموارد وإغلاق الاتصال بأمان
-cap.release()
-cv2.destroyAllWindows()
-controller.close()
-db_manager.close()
-print("[INFO] Application exited cleanly.")
+if __name__ == "__main__":
+    main()

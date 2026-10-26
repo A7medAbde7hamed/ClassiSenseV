@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+
+# Model weights (too big for GitHub)
+*.pt
+yolo11n.pt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Firebase Credentials
+serviceAccountKey*.json
+*.json.json

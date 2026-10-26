@@ -1,8 +1,7 @@
-ultralytics
-opencv-python
-numpy
-pyfirmata2
-pyserial
-requests
-pymysql
-firebase-admin
+ultralytics==8.4.0
+opencv-python==4.12.0.88
+numpy==2.2.6
+pyserial==3.5
+firebase-admin==7.1.0
+
+lap==0.5.12

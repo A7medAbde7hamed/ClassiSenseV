@@ -1,0 +1,28 @@
+name: ClassiSense checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  software:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm test
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - run: g++ -std=c++17 -Itests/firmware_stub tests/firmware_test.cpp -o /tmp/firmware-test && /tmp/firmware-test
+  arduino-uno:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - run: arduino-cli core update-index
+      - run: arduino-cli core install arduino:avr
+      - run: arduino-cli compile --fqbn arduino:avr:uno firmware/classisense

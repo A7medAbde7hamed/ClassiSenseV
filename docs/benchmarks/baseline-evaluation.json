@@ -1,0 +1,11 @@
+{
+  "annotated_frames": 5,
+  "missing_predictions": 0,
+  "mae_people": 10.4,
+  "rmse_people": 10.469001862641921,
+  "bias_people": -10.4,
+  "exact_count_rate": 0.0,
+  "within_one_rate": 0.0,
+  "median_fps": 23.07,
+  "p95_inference_ms": 59.92
+}

@@ -1,162 +1,140 @@
-"""
-ClassiSense - وحدة إدارة قاعدة البيانات السحابية (Firebase Cloud Firestore)
-========================================================================
-1. تحديث الحالة اللحظية (Live Status) في وثيقة 'classroom/live_status' لتمكين الموقع من التحديث المباشر.
-2. تسجيل دوري في مجموعة 'monitoring_logs' كل 3 دقائق (180 ثانية).
-3. إرسال إنذار فوري في مجموعة 'alerts' عند وجود خطر (تسريب غاز أو حرارة مرتفعة).
-"""
-
-import time
+"""Durable SQLite outbox; Firebase work happens exclusively in a worker thread."""
+import json
+import os
 from pathlib import Path
-import firebase_admin
-from firebase_admin import credentials, firestore
+import sqlite3
+import threading
+import time
+import uuid
 
-# مسار ملف مفتاح الخدمة
-CURRENT_DIR = Path(__file__).resolve().parent
-KEY_PATH = CURRENT_DIR / "serviceAccountKey.json"
 
-# الفترات الزمنية وحدود الأمان
-LOG_INTERVAL = 180       # تسجيل دوري كل 3 دقائق (180 ثانية)
-LIVE_SYNC_INTERVAL = 2   # تحديث الحالة اللحظية كل ثانيتين للموقع
-TEMP_LIMIT = 45.0        # درجة الحرارة الخطرة (45 مئوية)
-ALERT_COOLDOWN = 60      # فترة انتظار (60 ثانية) لمنع تكرار نفس الإنذار
+class Outbox:
+    def __init__(self, path):
+        self.path = str(path)
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(self.path, check_same_thread=False, timeout=0.1)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, kind TEXT, payload TEXT, attempts INTEGER DEFAULT 0, due REAL DEFAULT 0)")
+        self.db.commit()
+
+    def enqueue(self, kind, payload):
+        with self.lock, self.db:
+            # Coalesce live status only; logs/alerts remain durable and ordered.
+            if kind == "live":
+                self.db.execute("DELETE FROM jobs WHERE kind='live'")
+            if self.db.execute("SELECT count(*) FROM jobs").fetchone()[0] >= 100000:
+                raise RuntimeError("Outbox full: restore connectivity or archive the database")
+            event_id = uuid.uuid4().hex
+            self.db.execute("INSERT INTO jobs(id,kind,payload) VALUES(?,?,?)", (event_id, kind, json.dumps(payload, allow_nan=False)))
+        return event_id
+
+    def next(self, now=None):
+        with self.lock:
+            row = self.db.execute("SELECT id,kind,payload,attempts FROM jobs WHERE due<=? ORDER BY CASE kind WHEN 'alert' THEN 0 WHEN 'live' THEN 1 ELSE 2 END,rowid LIMIT 1", (time.time() if now is None else now,)).fetchone()
+        return (row[0], row[1], json.loads(row[2]), row[3]) if row else None
+
+    def acknowledge(self, event_id):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM jobs WHERE id=?", (event_id,))
+
+    def fail(self, event_id, attempts, now=None):
+        with self.lock, self.db:
+            self.db.execute("UPDATE jobs SET attempts=?, due=? WHERE id=?", (attempts + 1, (time.time() if now is None else now) + min(60, 2 ** min(attempts, 6)), event_id))
+
+    def count(self):
+        with self.lock:
+            return self.db.execute("SELECT count(*) FROM jobs").fetchone()[0]
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+
+class FirebaseSink:
+    def __init__(self):
+        self.db = None
+
+    def __call__(self, kind, event_id, data):
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        if self.db is None:
+            key = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", str(Path(__file__).parent / "serviceAccountKey.json"))
+            try:
+                app = firebase_admin.get_app("classisense")
+            except ValueError:
+                app = firebase_admin.initialize_app(credentials.Certificate(key), name="classisense")
+            self.db = firestore.client(app=app)
+        payload = dict(data, updated_at=firestore.SERVER_TIMESTAMP)
+        if kind == "live":
+            self.db.collection("classroom").document("live_status").set(payload, timeout=5)
+        else:
+            # Stable event ID makes retry after a lost response idempotent.
+            collection = "alerts" if kind == "alert" else "monitoring_logs"
+            self.db.collection(collection).document(event_id).set(dict(payload, created_at=firestore.SERVER_TIMESTAMP), timeout=5)
 
 
 class DatabaseManager:
-    def __init__(self):
-        self.db = None
-        self.last_log_time = 0.0
-        self.last_live_sync = 0.0
-        self.last_gas_alert = 0.0
-        self.last_temp_alert = 0.0
-        
-        # فتح الاتصال بـ Firebase عند بدء التشغيل
-        self.connect()
+    def __init__(self, queue_path=None, sink=None, start_worker=True):
+        path = Path(queue_path or os.getenv("CLASSISENSE_OUTBOX", str(Path.home() / ".classisense" / "outbox.sqlite3")))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.outbox = Outbox(path)
+        self.sink = sink or FirebaseSink()
+        self.last_live = None
+        self.last_log = None
+        self.last_alert = {}
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self.last_success = None
+        self.last_error = None
+        self._thread = None
+        if start_worker:
+            self._thread = threading.Thread(target=self._run, name="firebase-outbox", daemon=True)
+            self._thread.start()
 
-    def connect(self):
-        """فتح الاتصال بـ Firebase Cloud Firestore"""
-        if not KEY_PATH.exists():
-            print(f"[DB Error] Service account key not found at: {KEY_PATH}")
-            self.db = None
-            return
-
+    def process_once(self, now=None):
+        job = self.outbox.next(now)
+        if not job:
+            return False
+        event_id, kind, payload, attempts = job
         try:
-            # تجنب إعادة التهيئة لو تم استدعاؤها مسبقاً
-            if not firebase_admin._apps:
-                cred = credentials.Certificate(str(KEY_PATH))
-                firebase_admin.initialize_app(cred)
-            
-            self.db = firestore.client()
-            print("[DB] Connected to Firebase Firestore successfully.")
-        except Exception as e:
-            print(f"[DB Error] Failed to connect to Firebase Firestore: {e}")
-            self.db = None
+            self.sink(kind, event_id, payload)
+        except Exception as exc:
+            self.last_error = type(exc).__name__
+            self.outbox.fail(event_id, attempts, now)
+        else:
+            self.outbox.acknowledge(event_id)
+            self.last_error = None
+            self.last_success = time.time()
+        return True
 
-    def update_live_status(self, sensor_data):
-        """تحديث الحالة الحالية لحظياً للقاعة (Live Document) للموقع"""
-        if not self.db:
-            return
+    def _run(self):
+        while not self._stop.is_set():
+            if not self.process_once():
+                self._wake.wait(0.5)
+                self._wake.clear()
 
-        now = time.monotonic()
-        if now - self.last_live_sync < LIVE_SYNC_INTERVAL:
-            return
-
-        try:
-            gas_val = sensor_data.get("gas_detected", 0)
-            doc_ref = self.db.collection("classroom").document("live_status")
-            doc_ref.set({
-                "people_count": int(sensor_data.get("people_count", 0)),
-                "led_is_on": bool(sensor_data.get("led_is_on", sensor_data.get("lights_on", False))),
-                "led_on_seconds": int(sensor_data.get("led_on_seconds", 0)),
-                "temperature_c": float(sensor_data.get("temperature_c")) if sensor_data.get("temperature_c") is not None else None,
-                "gas_detected": int(gas_val),
-                "gas_danger": bool(gas_val),
-                "updated_at": firestore.SERVER_TIMESTAMP
-            }, merge=True)
-            self.last_live_sync = now
-        except Exception as e:
-            print(f"[DB Live Warning] Failed to update live status: {e}")
-
-    def log_monitoring(self, people_count, led_is_on, led_on_seconds, temp, gas_detected):
-        """إدخال سجل دوري جديد في مجموعة monitoring_logs"""
-        if not self.db:
-            self.connect()
-            if not self.db:
-                return
-
-        try:
-            self.db.collection("monitoring_logs").add({
-                "people_count": int(people_count),
-                "led_is_on": bool(led_is_on),
-                "led_on_seconds": int(led_on_seconds),
-                "temperature_c": float(temp) if temp is not None else None,
-                "gas_detected": 1 if gas_detected else 0,
-                "created_at": firestore.SERVER_TIMESTAMP
-            })
-            gas_status_str = "DANGER (1)" if gas_detected else "SAFE (0)"
-            print(f"[DB Firestore] Logged monitoring record: Students={people_count}, Temp={temp}C, Gas={gas_status_str}")
-        except Exception as e:
-            print(f"[DB Error] Failed to insert monitoring log to Firestore: {e}")
-
-    def log_alert(self, alert_type, severity, value):
-        """إدخال إنذار جديد في مجموعة alerts"""
-        if not self.db:
-            self.connect()
-            if not self.db:
-                return
-
-        try:
-            self.db.collection("alerts").add({
-                "alert_type": str(alert_type),
-                "severity": str(severity),
-                "measured_value": float(value) if value is not None else None,
-                "created_at": firestore.SERVER_TIMESTAMP
-            })
-            print(f"[DB ALERT Firestore] Hazard alert logged: {alert_type} ({severity}) - Value: {value}")
-        except Exception as e:
-            print(f"[DB Error] Failed to log alert to Firestore: {e}")
-
-    def check_and_log_monitoring(self, sensor_data):
-        """فحص إرسال البيانات الدورية كل 3 دقائق + تحديث الحالة اللحظية"""
-        # أولاً: تحديث الحالة اللحظية للموقع
-        self.update_live_status(sensor_data)
-
-        # ثانياً: التسجيل الدوري كل 3 دقائق
-        now = time.monotonic()
-        if self.last_log_time == 0.0 or (now - self.last_log_time >= LOG_INTERVAL):
-            self.log_monitoring(
-                people_count=sensor_data.get("people_count", 0),
-                led_is_on=sensor_data.get("led_is_on", sensor_data.get("lights_on", False)),
-                led_on_seconds=sensor_data.get("led_on_seconds", 0),
-                temp=sensor_data.get("temperature_c"),
-                gas_detected=sensor_data.get("gas_detected", 0)
-            )
-            self.last_log_time = now
-
-    def check_and_trigger_alerts(self, gas_danger, temperature):
-        """فحص المخاطر (تسريب الغاز أو ارتفاع الحرارة) وإرسال التنبيهات لمجموعة alerts"""
-        now = time.monotonic()
-
-        # 1. إنذار تسريب الغاز فورياً عند وجود تسريب
-        if gas_danger:
-            if now - self.last_gas_alert >= ALERT_COOLDOWN:
-                self.log_alert("GAS_LEAK", "CRITICAL", 1.0)
-                self.last_gas_alert = now
-
-        # 2. إنذار ارتفاع درجة الحرارة
-        if temperature is not None and temperature >= TEMP_LIMIT:
-            if now - self.last_temp_alert >= ALERT_COOLDOWN:
-                self.log_alert("HIGH_TEMPERATURE", "CRITICAL", temperature)
-                self.last_temp_alert = now
+    def publish(self, data, now=None):
+        now = time.monotonic() if now is None else now
+        for kind, attr, interval in (("live", "last_live", 2), ("log", "last_log", 180)):
+            previous = getattr(self, attr)
+            if previous is None or now - previous >= interval:
+                self.outbox.enqueue(kind, data)
+                setattr(self, attr, now)
+        for field, alert in (("gas_state", "GAS_LEAK"), ("temperature_state", "HIGH_TEMPERATURE")):
+            if data.get(field) == "danger" and (alert not in self.last_alert or now-self.last_alert[alert] >= 60):
+                self.outbox.enqueue("alert", dict(data, alert_type=alert, severity="CRITICAL"))
+                self.last_alert[alert] = now
+        self._wake.set()
 
     def get_hud_status(self):
-        """نص حالة قاعدة البيانات لعرضه على شاشة الكاميرا/الفيديو"""
-        if not self.db:
-            return "Firebase: Offline"
-        remaining = max(0, int(LOG_INTERVAL - (time.monotonic() - self.last_log_time)))
-        return f"Firebase: Online (Next: {remaining}s)"
+        return f"Cloud: {'retrying' if self.last_error else 'synced' if self.last_success else 'waiting'} | Queue: {self.outbox.count()}"
 
     def close(self):
-        """إغلاق الموارد عند إنهاء البرنامج"""
-        self.db = None
-        print("[DB] Firebase session closed.")
+        self._stop.set()
+        self._wake.set()
+        if self._thread:
+            self._thread.join(timeout=7)
+        # If an SDK call is still in progress, leave the DB for that daemon to finish;
+        # committed jobs already survive process exit and restart.
+        if not self._thread or not self._thread.is_alive():
+            self.outbox.close()
