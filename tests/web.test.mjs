@@ -57,3 +57,12 @@ test('password sign-in sets HttpOnly secure session, rejects CSRF',async()=>{
   const blocked=response();await session({method:'POST',headers:{origin:'https://evil.test',host:'lab.test'},body:{password:'test-password'}},blocked);assert.equal(blocked.statusCode,403);
  }finally{if(old)process.env.DASHBOARD_PASSWORD=old;else delete process.env.DASHBOARD_PASSWORD;}
 });
+test('offline navigation falls back to cached shell while API bypasses cache',async()=>{
+ const vm=await import('node:vm');const handlers={};let cachedPath;
+ const context={URL,fetch:async()=>{throw new Error('offline');},caches:{match:async path=>{cachedPath=path;return {offlineShell:true};}},self:{location:{origin:'https://lab.test'},addEventListener:(name,fn)=>handlers[name]=fn}};
+ vm.runInNewContext(await readFile('public/sw.js','utf8'),context);
+ let response;
+ handlers.fetch({request:{url:'https://lab.test/history',method:'GET',mode:'navigate'},respondWith(value){response=value;}});
+ assert.deepEqual(await response,{offlineShell:true});assert.equal(cachedPath,'/index.html');
+ let intercepted=false;handlers.fetch({request:{url:'https://lab.test/api/monitoring',method:'GET'},respondWith(){intercepted=true;}});assert.equal(intercepted,false);
+});

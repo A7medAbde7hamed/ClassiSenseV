@@ -157,4 +157,6 @@ window.addEventListener('offline',()=>{render();toast('Offline. Live readings ar
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
 $('#today').textContent=new Date().toLocaleDateString([], {weekday:'short',month:'short',day:'numeric',year:'numeric'});
 render();refresh();setInterval(()=>{if(!document.hidden)refresh();},10000);setInterval(()=>{if(!document.hidden&&!demo)render();},3000);
-if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>console.warn('Offline shell unavailable'));
+if('serviceWorker' in navigator){
+ navigator.serviceWorker.register('/sw.js').then(()=>navigator.serviceWorker.ready).then(()=>{$('#offline-state').textContent='Offline interface ready. Live data requires a network connection.';}).catch(()=>{$('#offline-state').textContent='Offline interface unavailable. Live data requires a network connection.';});
+}else $('#offline-state').textContent='Offline interface unavailable in this browser.';
