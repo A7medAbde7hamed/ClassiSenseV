@@ -1,4 +1,4 @@
-const CACHE='classisense-shell-v2';
+const CACHE='classisense-shell-v3-dark';
 const ASSETS=['/','/index.html','/styles.css','/fonts.css','/app.js','/manifest.webmanifest','/icons/mark.svg','/icons/icon-192.png','/icons/icon-512.png','/icons/maskable-512.png'];
 self.addEventListener('install',event=>{event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(ASSETS)));self.skipWaiting();});
 self.addEventListener('activate',event=>{event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(key=>key!==CACHE).map(key=>caches.delete(key)))).then(()=>self.clients.claim()));});
